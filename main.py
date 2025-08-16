@@ -46,7 +46,7 @@ def analyze_parquet(file: UploadFile):
 
 # --- Streaming LLM agent planning via HTTPX ---
 async def stream_agent_answer(question: str, context: dict) -> AsyncGenerator[bytes, None]:
-    api_key = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIzZjIwMDE2OTFAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.bytu_vnkiC5Fkn0lhzLRzgCjMRSBxOU5rwOoVxT6hzs"
+    api_key = "replace with your own API key"
     tools_desc = """
     You can:
     - Use pandas/duckdb for tabular data
