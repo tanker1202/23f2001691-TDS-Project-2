@@ -1,122 +1,135 @@
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
-import pandas as pd
+import os
+import io
+import httpx
 import duckdb
-import matplotlib.pyplot as plt
-import io, base64, os, json, asyncio, httpx
+import pytesseract
+import pandas as pd
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import StreamingResponse
+from PIL import Image
 from bs4 import BeautifulSoup
-from typing import List, Optional, AsyncGenerator
+from dotenv import load_dotenv
 
+load_dotenv()
 app = FastAPI()
 
-# --- Utility: Encode matplotlib figure as base64 string ---
-def fig_to_base64():
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight")
-    plt.close()
-    buf.seek(0)
-    b64 = base64.b64encode(buf.read()).decode("utf-8")
-    return f"data:image/png;base64,{b64}"
+OPENAI_API_KEY = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIzZjIwMDE2OTFAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.bytu_vnkiC5Fkn0lhzLRzgCjMRSBxOU5rwOoVxT6hzs"
+OPENAI_API_URL = "https://aipipe.org/openrouter/v1/chat/completions"
 
-# --- Heuristic file processors ---
-def analyze_csv(file: UploadFile):
-    try:
+
+# ---------- File Extractors ----------
+
+def extract_text_from_image(file: UploadFile) -> str:
+    """OCR extract text from image."""
+    image = Image.open(io.BytesIO(file.file.read()))
+    text = pytesseract.image_to_string(image)
+    file.file.seek(0)
+    return text
+
+
+def load_dataframe(file: UploadFile) -> pd.DataFrame:
+    """Load CSV, Excel, or Parquet as a DataFrame."""
+    filename = file.filename.lower()
+    if filename.endswith(".csv"):
         df = pd.read_csv(file.file)
-        summary = {
-            "columns": df.columns.tolist(),
-            "shape": df.shape,
-            "head": df.head().to_dict(orient="records"),
-        }
-        if df.shape[1] >= 2:
-            df.iloc[:,0:2].plot()
-            summary["plot"] = fig_to_base64()
-        return summary
-    except Exception as e:
-        return {"error": str(e)}
-
-def analyze_parquet(file: UploadFile):
-    try:
+    elif filename.endswith((".xls", ".xlsx")):
+        df = pd.read_excel(file.file)
+    elif filename.endswith(".parquet"):
         df = pd.read_parquet(file.file)
-        return {
-            "columns": df.columns.tolist(),
-            "shape": df.shape,
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    else:
+        raise ValueError("Unsupported data format")
+    file.file.seek(0)
+    return df
 
-# --- Streaming LLM agent planning via HTTPX ---
-async def stream_agent_answer(question: str, context: dict) -> AsyncGenerator[bytes, None]:
-    api_key = "replace with your own API key"
-    tools_desc = """
-    You can:
-    - Use pandas/duckdb for tabular data
-    - Use matplotlib for plots (return as base64)
-    - Use BeautifulSoup/requests for web scraping
-    Always return JSON. If multiple answers: return a JSON array, else a JSON object.
-    """
 
-    prompt = f"""
-    The user asked: {question}
-    Available context keys: {list(context.keys())}
+def extract_text_from_html(file: UploadFile) -> str:
+    """Extract visible text from HTML."""
+    soup = BeautifulSoup(file.file.read(), "html.parser")
+    file.file.seek(0)
+    return soup.get_text(separator=" ")
 
-    {tools_desc}
-    """
 
+def extract_text_generic(file: UploadFile) -> str:
+    """Fallback: treat file as plain text."""
     try:
+        return file.file.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return "[Unsupported file format or unreadable binary data]"
+
+
+# ---------- API Endpoint ----------
+
+@app.post("/api/")
+async def query_api(
+    question: UploadFile = File(None),
+    image: UploadFile = File(None),
+    data: UploadFile = File(None),
+    attachments: list[UploadFile] = File(None)
+):
+    context_parts = []
+    dataframes = []
+
+    # Handle explicitly named params
+    if question:
+        context_parts.append(extract_text_generic(question))
+    if image:
+        context_parts.append(extract_text_from_image(image))
+    if data:
+        try:
+            df = load_dataframe(data)
+            dataframes.append(df)
+            context_parts.append(f"Data file '{data.filename}' loaded with shape {df.shape}.")
+        except Exception:
+            context_parts.append(extract_text_generic(data))
+
+    # Handle multiple generic attachments
+    if attachments:
+        for f in attachments:
+            fname = f.filename.lower()
+            if fname.endswith((".csv", ".xls", ".xlsx", ".parquet")):
+                try:
+                    df = load_dataframe(f)
+                    dataframes.append(df)
+                    context_parts.append(f"Data file '{f.filename}' loaded with shape {df.shape}.")
+                except Exception:
+                    context_parts.append(extract_text_generic(f))
+            elif fname.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff")):
+                context_parts.append(extract_text_from_image(f))
+            elif fname.endswith((".html", ".htm")):
+                context_parts.append(extract_text_from_html(f))
+            else:
+                context_parts.append(extract_text_generic(f))
+
+    # Register dataframes into DuckDB for querying
+    for idx, df in enumerate(dataframes):
+        duckdb.register(f"df{idx}", df)
+
+    # Combine all contexts
+    context_text = "\n".join(context_parts) if context_parts else ""
+
+    # Prepare OpenAI payload
+    payload = {
+        "model": "openai/gpt-4o-mini",
+        "stream": True,
+        "messages": [
+            {"role": "system", "content": "You are a data assistant. Use the files and datasets as context. If dataframes are available in DuckDB, you can suggest queries to analyze them."},
+            {"role": "user", "content": f"{context_text}"}
+        ]
+    }
+
+    async def event_stream():
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream(
-                "POST",
-                "https://aipipe.org/openrouter/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
+                "POST", OPENAI_API_URL, headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
                     "Content-Type": "application/json"
-                },
-                json={
-                    "model": "openai/gpt-4o-mini",
-                    "messages": [
-                        {"role": "system", "content": "You are a data analyst agent."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "temperature": 0,
-                    "stream": True
-                }
+                }, json=payload
             ) as response:
                 async for line in response.aiter_lines():
-                    if line.startswith("data: "):
+                    if line.strip().startswith("data: "):
                         data = line[len("data: "):]
-                        if data.strip() == "[DONE]":
+                        if data == "[DONE]":
                             break
-                        try:
-                            parsed = json.loads(data)
-                            delta = parsed["choices"][0]["delta"].get("content")
-                            if delta:
-                                yield delta.encode("utf-8")
-                        except Exception:
-                            continue
-    except Exception as e:
-        yield json.dumps({"error": str(e)}).encode("utf-8")
+                        yield data + "\n"
 
-# --- Main endpoint ---
-@app.post("/api/")
-async def process_query(
-    questions: UploadFile = File(..., description="questions.txt"),
-    files: Optional[List[UploadFile]] = File(None)
-):
-    q_text = (await questions.read()).decode("utf-8", errors="ignore")
-    context = {}
-
-    if files:
-        for f in files:
-            if f.filename.endswith(".csv"):
-                context[f.filename] = analyze_csv(f)
-            elif f.filename.endswith(".parquet"):
-                context[f.filename] = analyze_parquet(f)
-            elif f.filename.endswith(".json"):
-                try:
-                    context[f.filename] = json.load(f.file)
-                except Exception as e:
-                    context[f.filename] = {"error": str(e)}
-            else:
-                context[f.filename] = {"note": "Unsupported file type"}
-
-    return StreamingResponse(stream_agent_answer(q_text, context), media_type="text/plain")
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
