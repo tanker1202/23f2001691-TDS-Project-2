@@ -1,9 +1,11 @@
 fastapi
-uvicorn[standard]
+uvicorn
 httpx
-pandas
-matplotlib
-duckdb
-beautifulsoup4
-python-multipart
 python-dotenv
+duckdb
+pandas
+pyarrow
+openpyxl
+pillow
+pytesseract
+beautifulsoup4
